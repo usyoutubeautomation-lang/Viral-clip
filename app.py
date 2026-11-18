@@ -5,28 +5,10 @@ import subprocess, json, time, os, math
 API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=API_KEY)
 
-# Render Environment থেকে কুকিজ নিয়ে ফাইল তৈরি করা (JSON বা Netscape যেকোনো ফরম্যাট সাপোর্ট করবে)
 YT_COOKIES_DATA = os.environ.get("YT_COOKIES", "").strip()
 if YT_COOKIES_DATA:
-    if YT_COOKIES_DATA.startswith("["):
-        try:
-            cookies_list = json.loads(YT_COOKIES_DATA)
-            with open("cookies.txt", "w", encoding="utf-8") as f:
-                f.write("# Netscape HTTP Cookie File\n")
-                for c in cookies_list:
-                    domain = c.get("domain", "")
-                    flag = "TRUE" if domain.startswith(".") else "FALSE"
-                    path = c.get("path", "/")
-                    secure = "TRUE" if c.get("secure", False) else "FALSE"
-                    exp = str(int(c.get("expirationDate", 1893456000)))
-                    name = c.get("name", "")
-                    val = c.get("value", "")
-                    f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{exp}\t{name}\t{val}\n")
-        except Exception as e:
-            print("Cookie JSON parse error:", e)
-    else:
-        with open("cookies.txt", "w", encoding="utf-8") as f:
-            f.write(YT_COOKIES_DATA)
+    with open("cookies.txt", "w", encoding="utf-8") as f:
+        f.write(YT_COOKIES_DATA)
     YT_BYPASS = ["--cookies", "cookies.txt", "--extractor-args", "youtube:player_client=web,android"]
 else:
     YT_BYPASS = ["--extractor-args", "youtube:player_client=android,ios"]
@@ -215,3 +197,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as app:
     submit_btn.click(
         fn=process_livestream,
         inputs=[url_input, clip_slider],
+        outputs=[output_files, status_box]
+    )
+
+app.launch(server_name="0.0.0.0", server_port=7860)
