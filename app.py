@@ -1,6 +1,6 @@
 import gradio as gr
 import google.generativeai as genai
-import subprocess, json, time, os
+import subprocess, json, time, os, math
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=API_KEY)
@@ -19,59 +19,122 @@ def format_srt_time(seconds):
     millis = int((seconds - int(seconds)) * 1000)
     return f"{hrs:02}:{mins:02}:{secs:02},{millis:03}"
 
-def process_video(video_url, clip_count, progress=gr.Progress()):
+def sec_to_hms(seconds):
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hrs:02}:{mins:02}:{secs:02}"
+
+def process_livestream(video_url, clip_count, progress=gr.Progress()):
     if not video_url:
-        raise gr.Error("দয়া করে একটি সঠিক ভিডিও লিংক দিন!")
-        
-    progress(0.1, desc="১. 1080p ভিডিও ডাউনলোড হচ্ছে...")
-    if os.path.exists("input.mp4"):
-        os.remove("input.mp4")
-        
-    subprocess.run([
-        "yt-dlp", "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]", 
-        "-o", "input.mp4", video_url
-    ], check=True)
+        raise gr.Error("দয়া করে একটি সঠিক লাইভস্ট্রিম বা ভিডিও লিংক দিন!")
 
-    progress(0.3, desc="২. AI ভিডিওটি দেখছে এবং সেরা মুহূর্ত খুঁজছে...")
-    video_file = genai.upload_file(path="input.mp4")
-    while video_file.state.name == "PROCESSING":
-        time.sleep(5)
-        video_file = genai.get_file(video_file.name)
+    progress(0.05, desc="১. লাইভস্ট্রিমের মোট সময় যাচাই করা হচ্ছে...")
+    
+    # ভিডিওর মোট সময় (Duration) বের করা
+    res = subprocess.run(
+        ["yt-dlp", "--get-duration", video_url],
+        capture_output=True, text=True
+    )
+    dur_str = res.stdout.strip().split('\n')[0]
+    parts = [int(p) for p in dur_str.split(':')]
+    if len(parts) == 3:
+        total_seconds = parts[0]*3600 + parts[1]*60 + parts[2]
+    elif len(parts) == 2:
+        total_seconds = parts[0]*60 + parts[1]
+    else:
+        total_seconds = parts[0]
 
+    # ৩-৪ ঘণ্টার স্ট্রিমকে ৪০ মিনিটের (2400 সেকেন্ড) ছোট ভাগে ভাগ করা
+    chunk_size = 2400 
+    num_chunks = max(1, math.ceil(total_seconds / chunk_size))
+    clips_per_chunk = max(1, math.ceil(int(clip_count) / num_chunks))
+    
+    all_highlights = []
     model = genai.GenerativeModel(model_name="gemini-2.5-flash")
-    prompt = f"""
-    Analyze this video carefully. Find the top {int(clip_count)} most viral, funny, or intense moments (each 20 to 50 seconds long).
-    For each moment determine:
-    1. "start": exact start time in seconds.
-    2. "end": exact end time in seconds.
-    3. "layout": "split" (streamer facecam in a corner + gameplay/screen) OR "full_face" (streamer face fills whole screen).
-    4. "face_pos": If "split", choose from: "top_left", "top_right", "bottom_left", "bottom_right". If "full_face", put "center".
-    5. "captions": Transcribe spoken dialogue with relative timestamps from clip start (0.0s). English in English, Hindi strictly in Hinglish (Roman script). Short 3-5 word chunks.
 
-    Return ONLY valid JSON:
-    [{{"start": 45.0, "end": 80.0, "layout": "split", "face_pos": "bottom_left", "captions": [{{"start": 0.5, "end": 2.5, "text": "Bhai ye kya scene hai"}}]}}]
-    """
-    
-    response = model.generate_content([video_file, prompt])
-    clean_json = response.text.replace("```json", "").replace("```", "").strip()
-    highlights = json.loads(clean_json)
+    for c in range(num_chunks):
+        if len(all_highlights) >= int(clip_count):
+            break
+            
+        chunk_start = c * chunk_size
+        chunk_end = min((c + 1) * chunk_size, total_seconds)
+        
+        progress(0.1 + (0.4 * (c / num_chunks)), desc=f"২. স্ট্রিমের অংশ {c+1}/{num_chunks} ({sec_to_hms(chunk_start)} - {sec_to_hms(chunk_end)}) বিশ্লেষণ হচ্ছে...")
+        
+        low_res_file = f"chunk_{c}.mp4"
+        if os.path.exists(low_res_file):
+            os.remove(low_res_file)
 
+        # র‍্যাম বাঁচাতে শুধুমাত্র ওই ৪০ মিনিট অংশটি 360p তে ডাউনলোড করা
+        subprocess.run([
+            "yt-dlp", "-f", "worstvideo[height>=360][ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]",
+            "--download-sections", f"*{sec_to_hms(chunk_start)}-{sec_to_hms(chunk_end)}",
+            "-o", low_res_file, video_url
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if not os.path.exists(low_res_file):
+            continue
+
+        video_file = genai.upload_file(path=low_res_file)
+        while video_file.state.name == "PROCESSING":
+            time.sleep(5)
+            video_file = genai.get_file(video_file.name)
+
+        prompt = f"""
+        Analyze this livestream segment carefully. Find the top {clips_per_chunk} most viral, funny, or intense moments (each 20 to 50 seconds long).
+        For each moment determine:
+        1. "start": start time in seconds relative to this segment.
+        2. "end": end time in seconds relative to this segment.
+        3. "layout": "split" (streamer facecam in a corner + gameplay/screen) OR "full_face" (streamer face fills whole screen).
+        4. "face_pos": If "split", choose from: "top_left", "top_right", "bottom_left", "bottom_right". If "full_face", put "center".
+        5. "captions": Transcribe spoken dialogue with relative timestamps from clip start (0.0s). English in English, Hindi strictly in Hinglish (Roman script). Short 3-5 word chunks.
+
+        Return ONLY valid JSON:
+        [{{"start": 45.0, "end": 80.0, "layout": "split", "face_pos": "bottom_left", "captions": [{{"start": 0.5, "end": 2.5, "text": "Bhai ye kya scene hai"}}]}}]
+        """
+        
+        try:
+            response = model.generate_content([video_file, prompt])
+            clean_json = response.text.replace("```json", "").replace("```", "").strip()
+            chunk_highlights = json.loads(clean_json)
+            
+            for item in chunk_highlights:
+                item['abs_start'] = chunk_start + item['start']
+                item['abs_end'] = chunk_start + item['end']
+                all_highlights.append(item)
+        except Exception as e:
+            print(f"Chunk {c} error: {e}")
+
+        # র‍্যাম ও ডিস্ক খালি রাখতে কাজ শেষে 360p ফাইলটি মুছে ফেলা
+        genai.delete_file(video_file.name)
+        if os.path.exists(low_res_file):
+            os.remove(low_res_file)
+
+    all_highlights = all_highlights[:int(clip_count)]
     output_videos = []
-    
-    for i, item in enumerate(highlights):
-        progress(0.5 + (0.4 * (i / len(highlights))), desc=f"৩. ক্লিপ {i+1} এডিট এবং 1080p রেন্ডার হচ্ছে...")
-        start_t = item['start']
-        duration = item['end'] - start_t
+
+    for i, item in enumerate(all_highlights):
+        progress(0.55 + (0.4 * (i / len(all_highlights))), desc=f"৩. সেরা ক্লিপ {i+1} সরাসরি 1080p তে ডাউনলোড ও এডিট হচ্ছে...")
+        
+        abs_start = item['abs_start']
+        abs_end = item['abs_end']
         layout = item['layout']
         face_pos = item.get('face_pos', 'bottom_left')
         
-        raw_clip = f"raw_{i}.mp4"
+        raw_1080p = f"raw_1080p_{i}.mp4"
         srt_file = f"sub_{i}.srt"
-        final_out = f"Viral_Clip_{i+1}_1080p.mp4"
+        final_out = f"Viral_Stream_Clip_{i+1}_1080p.mp4"
 
+        for f_name in [raw_1080p, srt_file, final_out]:
+            if os.path.exists(f_name):
+                os.remove(f_name)
+
+        # শুধুমাত্র ওই ৩০-৫০ সেকেন্ডের অংশটি সরাসরি 1080p কোয়ালিটিতে ডাউনলোড করা
         subprocess.run([
-            "ffmpeg", "-y", "-ss", str(start_t), "-t", str(duration), 
-            "-i", "input.mp4", "-c:v", "libx264", "-crf", "18", "-c:a", "aac", raw_clip
+            "yt-dlp", "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+            "--download-sections", f"*{sec_to_hms(abs_start)}-{sec_to_hms(abs_end)}",
+            "-o", raw_1080p, video_url
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         with open(srt_file, "w", encoding="utf-8") as f:
@@ -93,29 +156,32 @@ def process_video(video_url, clip_count, progress=gr.Progress()):
             )
 
         subprocess.run([
-            "ffmpeg", "-y", "-i", raw_clip, "-filter_complex", filter_complex,
+            "ffmpeg", "-y", "-i", raw_1080p, "-filter_complex", filter_complex,
             "-map", "[outv]", "-map", "0:a", "-c:v", "libx264", "-crf", "18", 
             "-preset", "fast", "-c:a", "aac", final_out
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
+        if os.path.exists(raw_1080p):
+            os.remove(raw_1080p)
+            
         output_videos.append(final_out)
 
-    progress(1.0, desc="সব কাজ সম্পন্ন!")
+    progress(1.0, desc="সবগুলো 1080p ক্লিপ তৈরি সম্পন্ন!")
     return output_videos
 
 with gr.Blocks(theme=gr.themes.Soft()) as app:
-    gr.Markdown("# 🎬 AI Auto Viral Shorts Maker (1080p)")
-    gr.Markdown("যেকোনো ভিডিও বা লাইভস্ট্রিমের লিংক দিন, সিস্টেম নিজে থেকেই সেরা মুহূর্তগুলো তৈরি করে দেবে।")
+    gr.Markdown("# 🎬 AI Livestream Viral Shorts Maker (1080p)")
+    gr.Markdown("৩-৪ ঘণ্টার বড় লাইভস্ট্রিম বা যেকোনো ভিডিওর লিংক দিন। সিস্টেম নিজে থেকেই সেরা মুহূর্তগুলো খুঁজে 1080p কোয়ালিটি এবং Hinglish/English সাবটাইটেলসহ তৈরি করে দেবে।")
     
     with gr.Row():
-        url_input = gr.Textbox(label="ভিডিও বা লাইভস্ট্রিম লিংক", placeholder="https://youtube.com...")
-        clip_slider = gr.Slider(minimum=1, maximum=6, value=3, step=1, label="কয়টি ক্লিপ চান?")
+        url_input = gr.Textbox(label="লাইভস্ট্রিম বা ভিডিও লিংক", placeholder="https://youtube.com...")
+        clip_slider = gr.Slider(minimum=1, maximum=6, value=4, step=1, label="কয়টি ক্লিপ চান?")
         
     submit_btn = gr.Button("🚀 ক্লিপ তৈরি শুরু করুন", variant="primary")
-    output_files = gr.File(label="তৈরি হওয়া 1080p ভিডিওগুলো")
+    output_files = gr.File(label="তৈরি হওয়া 1080p ভিডিওগুলো (ডাউনলোড করতে ক্লিক করুন)")
     
     submit_btn.click(
-        fn=process_video,
+        fn=process_livestream,
         inputs=[url_input, clip_slider],
         outputs=output_files
     )
